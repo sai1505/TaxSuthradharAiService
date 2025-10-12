@@ -115,6 +115,36 @@ TaxSuthradhar/
    ```
 
 ---
+## 📁 .env Files
+TaxSuthradharAiService/.env (FastAPI + Langchain + R2 + GroQ)
+```bash
+GROQ_API_KEY=your_groq_api_key
+CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+R2_BUCKET_NAME=your_bucket_name
+R2_ACCESS_KEY_ID=your_access_key
+R2_SECRET_ACCESS_KEY=your_secret_key
+TAVILY_API_KEY=your_tavily_api_key
+```
+Use these in your FastAPI Python service like:
+
+```python
+import os
+groq_api_key = os.getenv("GROQ_API_KEY")
+cloudflare_id = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+# ... etc.
+```
+
+🔐 Security Note
+
+Never commit .env files to version control (GitHub).
+
+Add this to your .gitignore (if not already present):
+
+# .gitignore
+```bash
+.env
+**/.env
+```
 
 ## 🖥️ Usage
 
