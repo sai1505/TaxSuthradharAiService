@@ -182,59 +182,43 @@ async def upload_document(email: str, file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     
-    tmp_file_path = None
-    temp_dir = None
-    temp_zip_path = None
-    
+    tmp_file_path, temp_dir, temp_zip_path = None, None, None
     try:
-        # 1. Save the uploaded file temporarily to use with docling
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(await file.read())
             tmp_file_path = tmp_file.name
 
-        # 2. Process the document with Docling
-        print(f"📄 Processing file with Docling: {tmp_file_path}")
         converter = DocumentConverter()
         result = converter.convert(tmp_file_path)
         text_content = result.document.export_to_markdown()
-
+        
         docs = [LangChainDocument(page_content=text_content)]
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
+        splits = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
 
-        # 3. Save the FAISS index to a temporary local directory
         temp_dir = tempfile.mkdtemp()
         vectorstore.save_local(temp_dir)
-        print(f"✅ FAISS index saved locally to {temp_dir}")
 
-        # 4. Zip the directory and upload to R2
+        # --- NEW FILENAME LOGIC ---
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        zip_filename_base = os.path.join(tempfile.gettempdir(), f"index-{timestamp}")
-        temp_zip_path = shutil.make_archive(zip_filename_base, 'zip', temp_dir)
+        original_filename_base = os.path.splitext(file.filename)[0].replace(" ", "_")
+        zip_filename = f"{original_filename_base}-{timestamp}"
+        
+        temp_zip_base_path = os.path.join(tempfile.gettempdir(), zip_filename)
+        temp_zip_path = shutil.make_archive(temp_zip_base_path, 'zip', temp_dir)
 
         index_key = f"indexes/{email}/{os.path.basename(temp_zip_path)}"
         with open(temp_zip_path, 'rb') as zip_file:
-            s3_client.put_object(
-                Bucket=R2_BUCKET_NAME, Key=index_key, Body=zip_file, ContentType='application/zip'
-            )
+            s3_client.put_object(Bucket=R2_BUCKET_NAME, Key=index_key, Body=zip_file, ContentType='application/zip')
         print(f"✅ Zipped index uploaded to R2 with key: {index_key}")
 
-        # 5. Load retriever into memory for immediate use
         user_retrievers[email] = vectorstore.as_retriever()
-        
-        return {
-            "status": "success",
-            "message": f"File '{file.filename}' processed successfully.",
-            "index_key": index_key
-        }
+        return {"status": "success", "message": f"File '{file.filename}' processed.", "index_key": index_key}
     except Exception as e:
-        print(f"❌ Error processing document for {email}: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
     finally:
-        print("--- Running cleanup ---")
         if tmp_file_path and os.path.exists(tmp_file_path): os.unlink(tmp_file_path)
         if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         if temp_zip_path and os.path.exists(temp_zip_path): os.unlink(temp_zip_path)
@@ -324,69 +308,124 @@ async def get_chat_content(key: str):
         print(f"❌ Error retrieving chat {key}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve chat content: {e}")
 
-@app.delete("/delete-chat/{email}", summary="Delete a specific chat history")
+@app.delete("/delete-chat/{email}", summary="Delete a specific chat history and its document index")
 async def delete_chat(email: str, key: str):
-    """
-    Deletes a single chat object from R2, ensuring the user owns it.
-    The object key is passed as a query parameter.
-    """
-    # Security check: Ensure the key belongs to the user trying to delete it.
     if not key.startswith(f"chats/{email}/"):
-        raise HTTPException(status_code=403, detail="Access denied: You do not have permission to delete this chat.")
+        raise HTTPException(status_code=403, detail="Access denied.")
     
     try:
-        # Delete the main chat JSON file
+        # 1. Get the chat object to find the associated index_key
+        chat_obj = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        chat_content = json.loads(chat_obj['Body'].read().decode('utf-8'))
+        index_key_to_delete = chat_content.get("index_key")
+
+        # 2. If an index exists, delete it
+        if index_key_to_delete:
+            s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=index_key_to_delete)
+            print(f"✅ Deleted associated index: {index_key_to_delete}")
+        
+        # 3. Delete the main chat JSON file
         s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
         print(f"✅ Deleted chat object: {key}")
         
-        # Optional but recommended: Delete the associated document index if it exists
-        # To do this, we first need to read the chat file to get the index_key
-        # Since we just deleted it, we can't. A better approach would be to get the object,
-        # extract the index_key, delete the index, then delete the chat.
-        # For simplicity now, we'll just delete the chat file.
-
         return {"status": "success", "message": f"Deleted chat {key}"}
-        
     except s3_client.exceptions.NoSuchKey:
-        # If the file is already gone, consider it a success.
         return {"status": "success", "message": f"Chat {key} not found, presumed deleted."}
     except Exception as e:
-        print(f"❌ Error deleting chat {key}: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to delete chat: {e}")
 
-
 # --- NEW: Endpoint to delete all chats for a user ---
-@app.delete("/chats/clear/{email}", summary="Delete all chat histories for a user")
+@app.delete("/chats/clear/{email}", summary="Delete all chat histories and document indexes for a user")
 async def clear_all_chats(email: str):
-    """
-    Lists all chat objects for a given user and deletes them in a single batch operation.
-    """
-    prefix = f"chats/{email}/"
     try:
-        # 1. List all objects with the user's prefix
+        # Batch delete all chat files
+        chat_prefix = f"chats/{email}/"
+        chat_objects = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=chat_prefix).get('Contents', [])
+        if chat_objects:
+            chats_to_delete = [{'Key': obj['Key']} for obj in chat_objects]
+            s3_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={'Objects': chats_to_delete})
+            print(f"✅ Cleared {len(chats_to_delete)} chats for user {email}")
+
+        # Batch delete all index files
+        index_prefix = f"indexes/{email}/"
+        index_objects = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=index_prefix).get('Contents', [])
+        if index_objects:
+            indexes_to_delete = [{'Key': obj['Key']} for obj in index_objects]
+            s3_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={'Objects': indexes_to_delete})
+            print(f"✅ Cleared {len(indexes_to_delete)} document indexes for user {email}")
+
+        return {"status": "success", "message": "All user data cleared."}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to clear user data: {e}")
+
+@app.get("/documents/{email}", summary="List all uploaded document indexes for a user")
+async def get_document_list(email: str):
+    """
+    Lists all document index files for a user, parsing the original filename
+    and providing the upload date.
+    """
+    document_list = []
+    prefix = f"indexes/{email}/"
+    try:
         response = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
         if 'Contents' not in response:
-            return {"status": "success", "message": "No chats found to delete."}
+            return []
+        
+        # Sort by most recently uploaded
+        sorted_objects = sorted(response['Contents'], key=lambda obj: obj['LastModified'], reverse=True)
+        ist_tz = ZoneInfo("Asia/Kolkata")
 
-        # 2. Format the list of keys for the delete_objects request
-        objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
-        
-        # 3. Execute the batch delete operation
-        delete_response = s3_client.delete_objects(
-            Bucket=R2_BUCKET_NAME,
-            Delete={'Objects': objects_to_delete}
-        )
-        
-        deleted_count = len(delete_response.get('Deleted', []))
-        print(f"✅ Cleared {deleted_count} chats for user {email}")
-        
-        return {"status": "success", "message": f"Successfully deleted {deleted_count} chats."}
+        for obj in sorted_objects:
+            object_key = obj['Key']
+            # --- Filename Parsing Logic ---
+            # Extracts the original filename from the R2 key
+            # e.g., "indexes/user@test.com/My_ITR_Form-20251012-103000.zip" -> "My_ITR_Form.pdf"
+            filename_with_ext = os.path.basename(object_key)
+            # Find the last hyphen, which separates the name from the timestamp
+            last_hyphen_index = filename_with_ext.rfind('-')
+            if last_hyphen_index != -1:
+                original_filename_base = filename_with_ext[:last_hyphen_index]
+                # Replace underscores back with spaces for display and assume it was a PDF
+                display_filename = f"{original_filename_base.replace('_', ' ')}.pdf"
+            else:
+                # Fallback in case the format is unexpected
+                display_filename = filename_with_ext
 
+            local_time = obj['LastModified'].astimezone(ist_tz)
+            date_str = local_time.strftime("%B %d, %Y") # Format date nicely
+
+            document_list.append({
+                "id": object_key,
+                "filename": display_filename,
+                "uploadDate": date_str
+            })
+            
+        return document_list
     except Exception as e:
-        print(f"❌ Error clearing chats for {email}: {e}")
+        print(f"❌ Error listing documents for {email}: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to clear chat history: {e}")
-        
+        raise HTTPException(status_code=500, detail="Failed to retrieve document list.")
+
+@app.delete("/document/{email}", summary="Delete a specific document index")
+async def delete_document(email: str, key: str):
+    """
+    Deletes a single document index file from R2, ensuring the user owns it.
+    The object key is passed as a query parameter.
+    """
+    # Security check: Ensure the key belongs to the user trying to delete it.
+    if not key.startswith(f"indexes/{email}/"):
+        raise HTTPException(status_code=403, detail="Access denied: You do not have permission to delete this document.")
+    
+    try:
+        s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+        print(f"✅ Deleted document index: {key}")
+        return {"status": "success", "message": f"Deleted document {key}"}
+    except Exception as e:
+        print(f"❌ Error deleting document {key}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+
 # --- Main entry point ---
 if __name__ == "__main__":
     print("🚀 Starting FastAPI server...")
