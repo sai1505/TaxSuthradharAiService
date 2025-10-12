@@ -27,7 +27,7 @@ import zipfile
 import io
 import shutil
 import traceback
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict
 
 # --- PDF Processing Library ---
 from docling.document_converter import DocumentConverter
@@ -110,13 +110,23 @@ document_chain = create_stuff_documents_chain(chat_model, rag_prompt)
 
 # 2. Chain for Web Search Questions
 web_search_prompt = ChatPromptTemplate.from_template("""
-You are an expert AI assistant specializing in Indian tax laws and finance.
-Answer the user's question based on the following up-to-date web search results.
-Provide a clear, actionable answer. If giving advice, remind the user to consult a professional.
+You are an expert Indian tax consultant specializing in helping IT employees
+legally save tax under the Income Tax Act.
 
-<context>
+### Context:
 {context}
-</context>
+
+Based on the context and retrieved knowledge:
+1. Identify all applicable legal tax-saving options (e.g., 80C, 80D, 80CCD, 24B, HRA, etc.).
+2. Suggest compliant investment and deduction strategies.
+3. Indicate whether the Old or New tax regime is better for this employee.
+4. Provide a brief legal explanation for each recommendation.
+5. End with a simple step-by-step action checklist for saving tax legally.
+
+Ensure your advice:
+- Is strictly within Indian tax laws.
+- Avoids any unethical or illegal suggestions.
+- Is concise, accurate, and actionable.
 
 Question: {input}
 """)
@@ -314,6 +324,69 @@ async def get_chat_content(key: str):
         print(f"❌ Error retrieving chat {key}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve chat content: {e}")
 
+@app.delete("/delete-chat/{email}", summary="Delete a specific chat history")
+async def delete_chat(email: str, key: str):
+    """
+    Deletes a single chat object from R2, ensuring the user owns it.
+    The object key is passed as a query parameter.
+    """
+    # Security check: Ensure the key belongs to the user trying to delete it.
+    if not key.startswith(f"chats/{email}/"):
+        raise HTTPException(status_code=403, detail="Access denied: You do not have permission to delete this chat.")
+    
+    try:
+        # Delete the main chat JSON file
+        s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+        print(f"✅ Deleted chat object: {key}")
+        
+        # Optional but recommended: Delete the associated document index if it exists
+        # To do this, we first need to read the chat file to get the index_key
+        # Since we just deleted it, we can't. A better approach would be to get the object,
+        # extract the index_key, delete the index, then delete the chat.
+        # For simplicity now, we'll just delete the chat file.
+
+        return {"status": "success", "message": f"Deleted chat {key}"}
+        
+    except s3_client.exceptions.NoSuchKey:
+        # If the file is already gone, consider it a success.
+        return {"status": "success", "message": f"Chat {key} not found, presumed deleted."}
+    except Exception as e:
+        print(f"❌ Error deleting chat {key}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete chat: {e}")
+
+
+# --- NEW: Endpoint to delete all chats for a user ---
+@app.delete("/chats/clear/{email}", summary="Delete all chat histories for a user")
+async def clear_all_chats(email: str):
+    """
+    Lists all chat objects for a given user and deletes them in a single batch operation.
+    """
+    prefix = f"chats/{email}/"
+    try:
+        # 1. List all objects with the user's prefix
+        response = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+        if 'Contents' not in response:
+            return {"status": "success", "message": "No chats found to delete."}
+
+        # 2. Format the list of keys for the delete_objects request
+        objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+        
+        # 3. Execute the batch delete operation
+        delete_response = s3_client.delete_objects(
+            Bucket=R2_BUCKET_NAME,
+            Delete={'Objects': objects_to_delete}
+        )
+        
+        deleted_count = len(delete_response.get('Deleted', []))
+        print(f"✅ Cleared {deleted_count} chats for user {email}")
+        
+        return {"status": "success", "message": f"Successfully deleted {deleted_count} chats."}
+
+    except Exception as e:
+        print(f"❌ Error clearing chats for {email}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to clear chat history: {e}")
+        
 # --- Main entry point ---
 if __name__ == "__main__":
     print("🚀 Starting FastAPI server...")
