@@ -89,7 +89,7 @@ class ChatHistoryRequest(BaseModel):
     email: str = Field(...); messages: List[ChatMessage] = Field(...)
     chat_id: Optional[str] = Field(None); index_key: Optional[str] = Field(None)
 class ChatMetadata(BaseModel):
-    id: str; title: str; date: str
+    id: str; title: str; date: str; attached_document: Optional[str] = None 
 class LoadContextRequest(BaseModel):
     chat_id: str; email: str
 
@@ -274,26 +274,52 @@ async def get_chat_list(email: str):
     try:
         prefix = f"chats/{email}/"
         response = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
-        if 'Contents' not in response: return []
-        
+        if 'Contents' not in response:
+            return []
+
         sorted_objects = sorted(response['Contents'], key=lambda obj: obj['LastModified'], reverse=True)
         ist_tz = ZoneInfo("Asia/Kolkata")
         chat_list = []
 
         for obj in sorted_objects:
+            object_key = obj['Key']
             try:
-                file_obj = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=obj['Key'])
-                messages = json.loads(file_obj['Body'].read().decode('utf-8')).get("messages", [])
+                file_obj = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=object_key)
+                chat_content = json.loads(file_obj['Body'].read().decode('utf-8'))
+                messages = chat_content.get("messages", [])
+
                 first_message = next((msg['text'] for msg in messages if msg['sender'] == 'user'), "Untitled Chat")
                 title = (first_message[:50] + '...') if len(first_message) > 50 else first_message
-                date_str = obj['LastModified'].astimezone(ist_tz).strftime("%B %d, %Y, %I:%M %p")
-                chat_list.append(ChatMetadata(id=obj['Key'], title=title, date=date_str))
+                local_time = obj['LastModified'].astimezone(ist_tz)
+                date_str = local_time.strftime("%B %d, %Y, %I:%M %p")
+
+                # --- NEW LOGIC TO GET ATTACHED DOCUMENT FILENAME ---
+                attached_document_name = None
+                index_key = chat_content.get("index_key")
+                if index_key:
+                    # Parse the filename from the index_key, just like in the /documents endpoint
+                    filename_with_ext = os.path.basename(index_key)
+                    last_hyphen_index = filename_with_ext.rfind('-')
+                    if last_hyphen_index != -1:
+                        original_filename_base = filename_with_ext[:last_hyphen_index]
+                        attached_document_name = f"{original_filename_base.replace('_', ' ')}.pdf"
+                    else:
+                        attached_document_name = filename_with_ext # Fallback
+                # --- END OF NEW LOGIC ---
+
+                chat_list.append(ChatMetadata(
+                    id=object_key, 
+                    title=title, 
+                    date=date_str,
+                    attached_document=attached_document_name # Add the new field here
+                ))
             except Exception as e:
-                print(f"Skipping file {obj['Key']} due to parsing error: {e}")
+                print(f"Skipping file {object_key} due to parsing error: {e}")
+                continue
         return chat_list
     except Exception as e:
         print(f"❌ Error listing chats for {email}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve chat list: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve chat list.")
 
 @app.get("/chat", response_model=dict, summary="Retrieve a specific chat conversation")
 async def get_chat_content(key: str):
@@ -307,6 +333,7 @@ async def get_chat_content(key: str):
     except Exception as e:
         print(f"❌ Error retrieving chat {key}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve chat content: {e}")
+
 
 @app.delete("/delete-chat/{email}", summary="Delete a specific chat history and its document index")
 async def delete_chat(email: str, key: str):
